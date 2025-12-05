@@ -81,61 +81,35 @@ The files are deleted inside the Linux filesystem, but the Windows VHDX file rem
 
 ## 🏗 Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     DOCKER DESKTOP GUI                          │
-│                    (Windows Application)                        │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   WSL2 INTEGRATION LAYER                        │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │              docker-desktop (WSL2 Distro)                │   │
-│  │  • Docker Engine                                         │   │
-│  │  • Container Runtime                                     │   │
-│  │  • Image Storage                                         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    VHDX STORAGE LAYER                           │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │     %LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx     │   │
-│  │                                                          │   │
-│  │     ┌──────────┐  ┌──────────┐  ┌──────────┐           │   │
-│  │     │  Images  │  │ Volumes  │  │  Cache   │           │   │
-│  │     │  50 GB   │  │  30 GB   │  │  70 GB   │           │   │
-│  │     └──────────┘  └──────────┘  └──────────┘           │   │
-│  │                                                          │   │
-│  │     Total VHDX Size: 150 GB (auto-expanded)             │   │
-│  │     ⚠️  NEVER SHRINKS AUTOMATICALLY                     │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+### Docker Desktop WSL2 Storage Architecture
 
-### The Shrink Workflow
+<div align="center">
 
-```
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   EXPORT     │────▶│  UNREGISTER  │────▶│    DELETE    │
-│  docker.tar  │     │   distro     │     │  old VHDX    │
-└──────────────┘     └──────────────┘     └──────────────┘
-                                                 │
-                                                 ▼
-┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   ENABLE     │◀────│   RESTART    │◀────│    IMPORT    │
-│   SPARSE     │     │   Docker     │     │  fresh VHDX  │
-└──────────────┘     └──────────────┘     └──────────────┘
-                            │
-                            ▼
-                    ┌──────────────┐
-                    │   150 GB ──▶ │
-                    │     3 GB     │
-                    │      ✅      │
-                    └──────────────┘
-```
+![Docker Desktop WSL2 Storage Architecture](assets/architecture-diagram-1.png)
+
+</div>
+
+Docker Desktop on Windows uses WSL2 to run the Linux-based Docker engine. All container data, images, and volumes are stored inside a dynamically expanding VHDX virtual disk file.
+
+### The Problem: Auto-Expand, Never Shrink
+
+<div align="center">
+
+![The Problem - Auto Expand Never Shrink](assets/architecture-diagram-2.png)
+
+</div>
+
+WSL2 virtual disks automatically grow as you build images and create volumes, but they **never shrink automatically** when you delete data.
+
+### The Solution: Export-Unregister-Import Workflow
+
+<div align="center">
+
+![The Solution Workflow](assets/architecture-diagram-3.png)
+
+</div>
+
+The only guaranteed way to shrink the VHDX is to export the distro, unregister it (which deletes the bloated VHDX), and let Docker Desktop recreate a fresh, compact disk.
 
 ---
 
@@ -204,9 +178,17 @@ docker-wsl-vhdx-cleanup/
 ├── 📄 CONTRIBUTING.md              # Contribution guidelines
 ├── 📄 .gitignore                   # Git ignore patterns
 │
+├── 📂 assets/
+│   ├── architecture-diagram-1.png  # WSL2 Storage Architecture
+│   ├── architecture-diagram-2.png  # The Problem Visualization
+│   ├── architecture-diagram-3.png  # Solution Workflow
+│   ├── architecture-diagram-4.png  # Sparse Mode Behavior
+│   ├── architecture-diagram-5.png  # Script Execution Sequence
+│   └── architecture-diagram-6.png  # Decision Tree
+│
 ├── 📂 docs/
 │   ├── docker-wsl-vhdx-shrink-guide.md   # Comprehensive technical guide
-│   └── mermaid-diagram.md          # Architecture diagrams (Mermaid)
+│   └── mermaid-diagram.md          # Architecture diagrams (Mermaid source)
 │
 ├── 📂 scripts/
 │   ├── shrink-docker-wsl.ps1       # Main shrink automation script
@@ -223,6 +205,14 @@ docker-wsl-vhdx-cleanup/
 ---
 
 ## ⚙️ How It Works
+
+### Script Execution Flow
+
+<div align="center">
+
+![Script Execution Sequence](assets/architecture-diagram-5.png)
+
+</div>
 
 ### Step 1: Shutdown and Export
 
@@ -253,6 +243,12 @@ The script enables WSL2 sparse mode on the new VHDX, allowing future automatic s
 ```powershell
 wsl --manage docker-desktop --set-sparse true --allow-unsafe
 ```
+
+<div align="center">
+
+![Sparse Mode Behavior](assets/architecture-diagram-4.png)
+
+</div>
 
 ### Step 5: Trigger Windows TRIM
 
@@ -342,6 +338,14 @@ localhostForwarding=true
 ---
 
 ## 🔧 Troubleshooting
+
+### When Should You Run the Shrink Script?
+
+<div align="center">
+
+![Decision Tree - When to Shrink](assets/architecture-diagram-6.png)
+
+</div>
 
 ### "Distro not found" error
 
