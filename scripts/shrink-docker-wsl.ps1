@@ -59,11 +59,17 @@ param(
     [Parameter(HelpMessage = "Name of the Docker WSL distro")]
     [string]$DockerDistroName = "docker-desktop",
 
+    [Parameter(HelpMessage = "Name of the Docker data WSL distro (images/volumes)")]
+    [string]$DockerDataDistroName = "docker-desktop-data",
+
     [Parameter(HelpMessage = "Path for the export tar file")]
     [string]$ExportPath = "$env:TEMP\docker_desktop_export.tar",
 
     [Parameter(HelpMessage = "Path to Docker's WSL disk folder")]
     [string]$WslDiskFolder = "$env:LOCALAPPDATA\Docker\wsl\disk",
+
+    [Parameter(HelpMessage = "Path to Docker's WSL data folder (contains ext4.vhdx)")]
+    [string]$WslDataFolder = "$env:LOCALAPPDATA\Docker\wsl\data",
 
     [Parameter(HelpMessage = "Skip the export step")]
     [switch]$SkipExport,
@@ -131,6 +137,30 @@ function Get-WslDistros {
         return $output | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
     }
     return @()
+}
+
+function Get-DockerTargetDistro {
+    param(
+        [string[]]$Distros,
+        [string]$EngineDistro,
+        [string]$DataDistro
+    )
+
+    # Docker Desktop stores images/volumes in docker-desktop-data on most installs.
+    # Prefer shrinking that when present; otherwise fall back to docker-desktop.
+    if ($Distros -contains $DataDistro) {
+        return [pscustomobject]@{
+            Name = $DataDistro
+            Kind = "Data"
+        }
+    }
+    if ($Distros -contains $EngineDistro) {
+        return [pscustomobject]@{
+            Name = $EngineDistro
+            Kind = "Engine"
+        }
+    }
+    return $null
 }
 
 function Get-VhdxSize {
@@ -222,13 +252,17 @@ catch {
 $initialDistros = Get-WslDistros
 Write-Status "Current WSL distros: $($initialDistros -join ', ')"
 
-# Check if target distro exists
-$distroExists = $initialDistros -contains $DockerDistroName
+# Decide which distro to shrink (prefer data distro)
+$target = Get-DockerTargetDistro -Distros $initialDistros -EngineDistro $DockerDistroName -DataDistro $DockerDataDistroName
+$distroExists = $null -ne $target
 if ($distroExists) {
-    Write-Status "Target distro '$DockerDistroName' found" -Type "Success"
+    Write-Status "Target distro '$($target.Name)' selected ($($target.Kind))" -Type "Success"
+    if ($target.Kind -eq "Engine") {
+        Write-Status "Note: '$DockerDataDistroName' not found; shrinking engine distro only" -Type "Warning"
+    }
 }
 else {
-    Write-Status "Target distro '$DockerDistroName' not found" -Type "Warning"
+    Write-Status "No Docker WSL distros found ('$DockerDistroName' / '$DockerDataDistroName')" -Type "Warning"
     Write-Status "Will proceed to cleanup orphan VHDX files only"
 }
 
@@ -238,16 +272,38 @@ foreach ($name in $KnownVhdxNames) {
     $path = Join-Path $WslDiskFolder $name
     if (Test-Path $path) {
         $size = Get-VhdxSize $path
-        $vhdxFiles += @{ Path = $path; Size = $size; Name = $name }
+        $vhdxFiles += [pscustomobject]@{
+            Path = $path
+            Size = $size
+            Name = $name
+        }
         Write-Status "Found: $name ($size GB)"
     }
 }
 
-if ($vhdxFiles.Count -eq 0) {
-    Write-Status "No VHDX files found in $WslDiskFolder" -Type "Warning"
+if (Test-Path $WslDataFolder) {
+    $dataVhdx = Join-Path $WslDataFolder "ext4.vhdx"
+    if (Test-Path $dataVhdx) {
+        $size = Get-VhdxSize $dataVhdx
+        $vhdxFiles += [pscustomobject]@{
+            Path = $dataVhdx
+            Size = $size
+            Name = "ext4.vhdx (data)"
+        }
+        Write-Status "Found: ext4.vhdx (data) ($size GB)"
+    }
 }
 
-$totalSizeBefore = ($vhdxFiles | Measure-Object -Property Size -Sum).Sum
+if ($vhdxFiles.Count -eq 0) {
+    Write-Status "No VHDX files found in $WslDiskFolder or $WslDataFolder" -Type "Warning"
+}
+
+$totalSizeBefore = if ($vhdxFiles.Count -gt 0) {
+    ($vhdxFiles | Measure-Object -Property Size -Sum).Sum
+}
+else {
+    0
+}
 Write-Status "Total VHDX size before shrink: $totalSizeBefore GB" -Type "Info"
 
 # ============================================================================
@@ -282,7 +338,7 @@ else {
         Remove-Item -Force $ExportPath
     }
 
-    Write-Status "Exporting '$DockerDistroName' to: $ExportPath"
+    Write-Status "Exporting '$($target.Name)' to: $ExportPath"
     Write-Status "This may take several minutes depending on the distro size..."
 
     try {
@@ -291,7 +347,7 @@ else {
         Start-Sleep -Seconds 2
 
         # Perform export
-        $exportOutput = wsl.exe --export $DockerDistroName $ExportPath 2>&1
+        $exportOutput = wsl.exe --export $target.Name $ExportPath 2>&1
         
         if (Test-Path $ExportPath) {
             $exportSize = Get-VhdxSize $ExportPath
@@ -323,10 +379,10 @@ else {
 Write-Step "STEP 3: Unregistering Docker Desktop Distro"
 
 if ($distroExists) {
-    Write-Status "Unregistering '$DockerDistroName'..."
+    Write-Status "Unregistering '$($target.Name)'..."
     
     try {
-        wsl.exe --unregister $DockerDistroName
+        wsl.exe --unregister $target.Name
         Start-Sleep -Seconds 2
         Write-Status "Distro unregistered successfully" -Type "Success"
     }
@@ -341,6 +397,25 @@ else {
     Write-Status "Distro already unregistered, skipping..." -Type "Info"
 }
 
+# If we shrank the data distro, import it back so images/volumes return.
+if ($distroExists -and -not $SkipExport -and $exportSucceeded -and $target.Kind -eq "Data") {
+    Write-Step "STEP 3b: Importing Docker Data Distro"
+
+    try {
+        if (-not (Test-Path $WslDataFolder)) {
+            New-Item -ItemType Directory -Force -Path $WslDataFolder | Out-Null
+        }
+
+        Write-Status "Importing '$($target.Name)' back into: $WslDataFolder"
+        wsl.exe --import $target.Name $WslDataFolder $ExportPath 2>&1 | Out-Null
+        Write-Status "Import completed successfully" -Type "Success"
+    }
+    catch {
+        Write-Status "Import failed: $_" -Type "Error"
+        if (-not $Force) { exit 1 }
+    }
+}
+
 # ============================================================================
 # STEP 4: DELETE ORPHAN VHDX FILES
 # ============================================================================
@@ -348,17 +423,29 @@ else {
 Write-Step "STEP 4: Removing Orphan VHDX Files"
 
 $deletedSize = 0
+$skipDataFolderDeletes = $false
+if ($distroExists -and $target.Kind -eq "Data" -and -not $SkipExport -and $exportSucceeded) {
+    # We just imported the data distro back. Deleting ext4.vhdx now would wipe images/volumes.
+    $skipDataFolderDeletes = $true
+    Write-Status "Skipping deletes under data folder to preserve images/volumes: $WslDataFolder" -Type "Info"
+}
+
 foreach ($vhdx in $vhdxFiles) {
-    if (Test-Path $vhdx.Path) {
-        Write-Status "Deleting: $($vhdx.Name) ($($vhdx.Size) GB)"
-        try {
-            Remove-Item -Force $vhdx.Path
-            $deletedSize += $vhdx.Size
-            Write-Status "Deleted successfully" -Type "Success"
-        }
-        catch {
-            Write-Status "Failed to delete: $_" -Type "Error"
-        }
+    if (-not (Test-Path $vhdx.Path)) { continue }
+
+    if ($skipDataFolderDeletes -and ($vhdx.Path -like (Join-Path $WslDataFolder "*"))) {
+        Write-Status "Keeping: $($vhdx.Name) (data VHDX)" -Type "Info"
+        continue
+    }
+
+    Write-Status "Deleting: $($vhdx.Name) ($($vhdx.Size) GB)"
+    try {
+        Remove-Item -Force $vhdx.Path
+        $deletedSize += $vhdx.Size
+        Write-Status "Deleted successfully" -Type "Success"
+    }
+    catch {
+        Write-Status "Failed to delete: $_" -Type "Error"
     }
 }
 
@@ -405,9 +492,15 @@ else {
     }
 }
 
-# Wait for the distro to be recreated
-Write-Status "Waiting for Docker Desktop to recreate the WSL distro..."
-$distroRecreated = Wait-ForDistro -DistroName $DockerDistroName -TimeoutSeconds 180
+# Wait for the distro(s) to be available
+Write-Status "Waiting for Docker Desktop / WSL distros to be available..."
+$distroRecreated = $false
+if ($distroExists) {
+    $distroRecreated = Wait-ForDistro -DistroName $target.Name -TimeoutSeconds 180
+}
+else {
+    $distroRecreated = Wait-ForDistro -DistroName $DockerDistroName -TimeoutSeconds 180
+}
 
 if (-not $distroRecreated) {
     Write-Status "Distro did not appear within timeout" -Type "Warning"
@@ -425,10 +518,11 @@ if ($distroRecreated) {
     wsl.exe --shutdown
     Start-Sleep -Seconds 2
 
-    Write-Status "Enabling sparse mode on '$DockerDistroName'..."
+    $sparseTarget = if ($distroExists) { $target.Name } else { $DockerDistroName }
+    Write-Status "Enabling sparse mode on '$sparseTarget'..."
     
     try {
-        $sparseOutput = wsl.exe --manage $DockerDistroName --set-sparse true --allow-unsafe 2>&1
+        $sparseOutput = wsl.exe --manage $sparseTarget --set-sparse true --allow-unsafe 2>&1
         Write-Status "Sparse mode conversion requested" -Type "Success"
         Write-Status "Note: Some Windows builds may not fully support sparse mode" -Type "Info"
     }
@@ -483,11 +577,32 @@ foreach ($name in $KnownVhdxNames) {
     $path = Join-Path $WslDiskFolder $name
     if (Test-Path $path) {
         $size = Get-VhdxSize $path
-        $newVhdxFiles += @{ Path = $path; Size = $size; Name = $name }
+        $newVhdxFiles += [pscustomobject]@{
+            Path = $path
+            Size = $size
+            Name = $name
+        }
     }
 }
 
-$totalSizeAfter = ($newVhdxFiles | Measure-Object -Property Size -Sum).Sum
+if (Test-Path $WslDataFolder) {
+    $dataVhdx = Join-Path $WslDataFolder "ext4.vhdx"
+    if (Test-Path $dataVhdx) {
+        $size = Get-VhdxSize $dataVhdx
+        $newVhdxFiles += [pscustomobject]@{
+            Path = $dataVhdx
+            Size = $size
+            Name = "ext4.vhdx (data)"
+        }
+    }
+}
+
+$totalSizeAfter = if ($newVhdxFiles.Count -gt 0) {
+    ($newVhdxFiles | Measure-Object -Property Size -Sum).Sum
+}
+else {
+    0
+}
 
 # Check sparse status
 $sparseStatus = "Unknown"
