@@ -71,6 +71,9 @@ param(
     [Parameter(HelpMessage = "Path to Docker's WSL data folder (contains ext4.vhdx)")]
     [string]$WslDataFolder = "$env:LOCALAPPDATA\Docker\wsl\data",
 
+    [Parameter(HelpMessage = "Perform a full reset (export, unregister, delete VHDX). WARNING: This can reset Docker data on some setups.")]
+    [switch]$FullReset,
+
     [Parameter(HelpMessage = "Skip the export step")]
     [switch]$SkipExport,
 
@@ -306,6 +309,12 @@ else {
 }
 Write-Status "Total VHDX size before shrink: $totalSizeBefore GB" -Type "Info"
 
+$performFullReset = $FullReset.IsPresent
+if (-not $performFullReset) {
+    Write-Status "Running in NON-DESTRUCTIVE mode: not exporting, unregistering, or deleting VHDX files." -Type "Warning"
+    Write-Status "Only sparse mode (if supported) and Windows TRIM will run. Use -FullReset for a complete reset (this may wipe Docker data on some setups)." -Type "Warning"
+}
+
 # ============================================================================
 # STEP 1: SHUTDOWN WSL
 # ============================================================================
@@ -325,7 +334,10 @@ Write-Step "STEP 2: Exporting Docker Desktop Distro"
 
 $exportSucceeded = $false
 
-if ($SkipExport) {
+if (-not $performFullReset) {
+    Write-Status "Skipping export (non-destructive mode; -FullReset not specified)" -Type "Info"
+}
+elseif ($SkipExport) {
     Write-Status "Skipping export (SkipExport flag set)" -Type "Warning"
 }
 elseif (-not $distroExists) {
@@ -378,7 +390,10 @@ else {
 
 Write-Step "STEP 3: Unregistering Docker Desktop Distro"
 
-if ($distroExists) {
+if (-not $performFullReset) {
+    Write-Status "Skipping unregister (non-destructive mode; -FullReset not specified)" -Type "Info"
+}
+elseif ($distroExists) {
     Write-Status "Unregistering '$($target.Name)'..."
     
     try {
@@ -398,7 +413,7 @@ else {
 }
 
 # If we shrank the data distro, import it back so images/volumes return.
-if ($distroExists -and -not $SkipExport -and $exportSucceeded -and $target.Kind -eq "Data") {
+if ($performFullReset -and $distroExists -and -not $SkipExport -and $exportSucceeded -and $target.Kind -eq "Data") {
     Write-Step "STEP 3b: Importing Docker Data Distro"
 
     try {
@@ -423,29 +438,34 @@ if ($distroExists -and -not $SkipExport -and $exportSucceeded -and $target.Kind 
 Write-Step "STEP 4: Removing Orphan VHDX Files"
 
 $deletedSize = 0
-$skipDataFolderDeletes = $false
-if ($distroExists -and $target.Kind -eq "Data" -and -not $SkipExport -and $exportSucceeded) {
-    # We just imported the data distro back. Deleting ext4.vhdx now would wipe images/volumes.
-    $skipDataFolderDeletes = $true
-    Write-Status "Skipping deletes under data folder to preserve images/volumes: $WslDataFolder" -Type "Info"
+if (-not $performFullReset) {
+    Write-Status "Skipping VHDX deletion (non-destructive mode; -FullReset not specified)" -Type "Info"
 }
-
-foreach ($vhdx in $vhdxFiles) {
-    if (-not (Test-Path $vhdx.Path)) { continue }
-
-    if ($skipDataFolderDeletes -and ($vhdx.Path -like (Join-Path $WslDataFolder "*"))) {
-        Write-Status "Keeping: $($vhdx.Name) (data VHDX)" -Type "Info"
-        continue
+else {
+    $skipDataFolderDeletes = $false
+    if ($distroExists -and $target.Kind -eq "Data" -and -not $SkipExport -and $exportSucceeded) {
+        # We just imported the data distro back. Deleting ext4.vhdx now would wipe images/volumes.
+        $skipDataFolderDeletes = $true
+        Write-Status "Skipping deletes under data folder to preserve images/volumes: $WslDataFolder" -Type "Info"
     }
 
-    Write-Status "Deleting: $($vhdx.Name) ($($vhdx.Size) GB)"
-    try {
-        Remove-Item -Force $vhdx.Path
-        $deletedSize += $vhdx.Size
-        Write-Status "Deleted successfully" -Type "Success"
-    }
-    catch {
-        Write-Status "Failed to delete: $_" -Type "Error"
+    foreach ($vhdx in $vhdxFiles) {
+        if (-not (Test-Path $vhdx.Path)) { continue }
+
+        if ($skipDataFolderDeletes -and ($vhdx.Path -like (Join-Path $WslDataFolder "*"))) {
+            Write-Status "Keeping: $($vhdx.Name) (data VHDX)" -Type "Info"
+            continue
+        }
+
+        Write-Status "Deleting: $($vhdx.Name) ($($vhdx.Size) GB)"
+        try {
+            Remove-Item -Force $vhdx.Path
+            $deletedSize += $vhdx.Size
+            Write-Status "Deleted successfully" -Type "Success"
+        }
+        catch {
+            Write-Status "Failed to delete: $_" -Type "Error"
+        }
     }
 }
 
