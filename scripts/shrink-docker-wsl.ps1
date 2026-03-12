@@ -71,6 +71,9 @@ param(
     [Parameter(HelpMessage = "Path to Docker's WSL data folder (contains ext4.vhdx)")]
     [string]$WslDataFolder = "$env:LOCALAPPDATA\Docker\wsl\data",
 
+    [Parameter(HelpMessage = "Aggressively prune unused Docker data inside the data distro (docker system prune / builder prune).")]
+    [switch]$PruneDocker,
+
     [Parameter(HelpMessage = "Perform a full reset (export, unregister, delete VHDX). WARNING: This can reset Docker data on some setups.")]
     [switch]$FullReset,
 
@@ -255,6 +258,9 @@ catch {
 $initialDistros = Get-WslDistros
 Write-Status "Current WSL distros: $($initialDistros -join ', ')"
 
+# Track whether the data distro exists (where Docker images/volumes usually live)
+$dataDistroExists = $initialDistros -contains $DockerDataDistroName
+
 # Decide which distro to shrink (prefer data distro)
 $target = Get-DockerTargetDistro -Distros $initialDistros -EngineDistro $DockerDistroName -DataDistro $DockerDataDistroName
 $distroExists = $null -ne $target
@@ -325,6 +331,39 @@ Write-Status "Stopping all WSL instances..."
 wsl.exe --shutdown
 Start-Sleep -Seconds 3
 Write-Status "WSL shutdown complete" -Type "Success"
+
+# ============================================================================
+# STEP 1B: OPTIONAL DOCKER CLEANUP & FILESYSTEM TRIM (NON-DESTRUCTIVE)
+# ============================================================================
+
+if (-not $performFullReset -and $dataDistroExists) {
+    Write-Step "STEP 1B: Cleaning Docker Data and Trimming Filesystem (Safe Mode)"
+
+    if ($PruneDocker) {
+        Write-Status "Pruning unused Docker data inside '$DockerDataDistroName' (docker system prune -a --volumes)..." -Type "Warning"
+        try {
+            wsl.exe -d $DockerDataDistroName -- docker system prune -a --volumes -f 2>&1 | Out-Null
+            wsl.exe -d $DockerDataDistroName -- docker builder prune --all -f 2>&1 | Out-Null
+            Write-Status "Docker prune completed inside '$DockerDataDistroName'" -Type "Success"
+        }
+        catch {
+            Write-Status "Docker prune inside '$DockerDataDistroName' failed: $_" -Type "Warning"
+        }
+    }
+    else {
+        Write-Status "Skipping Docker prune inside '$DockerDataDistroName' (use -PruneDocker to enable)" -Type "Info"
+    }
+
+    Write-Status "Running filesystem TRIM (fstrim -av) inside '$DockerDataDistroName' to mark free blocks..." -Type "Info"
+    try {
+        # Try sudo if available; fall back to plain fstrim
+        wsl.exe -d $DockerDataDistroName -- sh -c "if command -v sudo >/dev/null 2>&1; then sudo fstrim -av; else fstrim -av; fi" 2>&1 | Out-Null
+        Write-Status "Filesystem TRIM inside '$DockerDataDistroName' completed" -Type "Success"
+    }
+    catch {
+        Write-Status "Filesystem TRIM inside '$DockerDataDistroName' failed (you may need sudo or fstrim support): $_" -Type "Warning"
+    }
+}
 
 # ============================================================================
 # STEP 2: EXPORT DISTRO (Optional)
@@ -465,6 +504,37 @@ else {
         }
         catch {
             Write-Status "Failed to delete: $_" -Type "Error"
+        }
+    }
+}
+
+# ============================================================================
+# STEP 4B: COMPACT VHDX FILES (NON-DESTRUCTIVE OPTIMIZE-VHD)
+# ============================================================================
+
+if (-not $performFullReset) {
+    Write-Step "STEP 4B: Compacting VHDX Files (Optimize-VHD)"
+
+    try {
+        Import-Module -Name Hyper-V -ErrorAction Stop
+    }
+    catch {
+        Write-Status "Hyper-V PowerShell module not available; skipping Optimize-VHD compaction. This may be expected on Windows Home." -Type "Warning"
+        $optimizeModuleAvailable = $false
+    }
+
+    if ($optimizeModuleAvailable -ne $false) {
+        foreach ($vhdx in $vhdxFiles) {
+            if (-not (Test-Path $vhdx.Path)) { continue }
+
+            Write-Status "Optimizing VHDX: $($vhdx.Path) (current reported size: $($vhdx.Size) GB)" -Type "Info"
+            try {
+                Optimize-VHD -Path $vhdx.Path -Mode Full
+                Write-Status "Optimize-VHD completed for: $($vhdx.Path)" -Type "Success"
+            }
+            catch {
+                Write-Status "Optimize-VHD failed for '$($vhdx.Path)': $_" -Type "Warning"
+            }
         }
     }
 }
