@@ -4,11 +4,16 @@
     Safely shrinks Docker Desktop's virtual disk from 100GB+ down to minimal size.
 
 .DESCRIPTION
-    This script performs a safe export-unregister-import cycle on the Docker Desktop
-    WSL2 distro to reclaim disk space. WSL2 virtual disks auto-expand but never
-    auto-shrink. This is the only reliable way to reclaim space.
+    Shrinks Docker Desktop WSL2 VHDX files without wiping images/containers/volumes
+    (safe mode, default). WSL2 virtual disks auto-expand but never auto-shrink.
 
-    The workflow:
+    Safe mode (default):
+    1. Optionally prune unused Docker data
+    2. Run fstrim inside docker-desktop-data OR on standalone docker_data.vhdx
+    3. Compact VHDX with Optimize-VHD or diskpart (Windows Home)
+    4. Enable sparse mode and trigger Windows TRIM
+
+    Full reset (-FullReset):
     1. Shutdown all WSL instances
     2. Export docker-desktop distro to a tar file (preserves data)
     3. Unregister the distro (removes the bloated VHDX)
@@ -16,6 +21,12 @@
     5. Restart Docker Desktop (recreates fresh compact VHDX)
     6. Enable sparse mode for future maintenance
     7. Trigger Windows TRIM to release freed space
+
+    Safe mode supports two Docker Desktop storage layouts:
+    - Classic: docker-desktop-data WSL distro (wsl\data\ext4.vhdx)
+    - Standalone: docker_data.vhdx on disk (common on Windows Home / newer installs)
+
+    Compaction uses Optimize-VHD when Hyper-V is available, otherwise diskpart compact vdisk.
 
 .PARAMETER DockerDistroName
     Name of the Docker WSL distro. Default: "docker-desktop"
@@ -35,9 +46,16 @@
 .PARAMETER KeepExport
     Keep the export tar file after completion. Useful for backup purposes.
 
+.PARAMETER TrimHelperDistro
+    WSL distro used to run fstrim when compacting standalone docker_data.vhdx. Auto-detected when omitted.
+
+.EXAMPLE
+    .\shrink-docker-wsl.ps1 -PruneDocker
+    Safe non-destructive shrink. Works on Windows Home and standalone docker_data.vhdx layouts.
+
 .EXAMPLE
     .\shrink-docker-wsl.ps1
-    Run with default settings. Exports, shrinks, and restores docker-desktop.
+    Run safe compaction with default settings (preserves Docker data).
 
 .EXAMPLE
     .\shrink-docker-wsl.ps1 -SkipExport -Force
@@ -70,6 +88,12 @@ param(
 
     [Parameter(HelpMessage = "Path to Docker's WSL data folder (contains ext4.vhdx)")]
     [string]$WslDataFolder = "$env:LOCALAPPDATA\Docker\wsl\data",
+
+    [Parameter(HelpMessage = "Path to Docker's WSL main folder (engine ext4.vhdx on newer installs)")]
+    [string]$WslMainFolder = "$env:LOCALAPPDATA\Docker\wsl\main",
+
+    [Parameter(HelpMessage = "WSL distro used to run fstrim on standalone docker_data.vhdx (auto-detected when omitted)")]
+    [string]$TrimHelperDistro = "",
 
     [Parameter(HelpMessage = "Aggressively prune unused Docker data inside the data distro (docker system prune / builder prune).")]
     [switch]$PruneDocker,
@@ -187,6 +211,205 @@ function Find-DockerDesktop {
     return $null
 }
 
+function Get-StandaloneDockerDataVhdxPath {
+    param([string]$DiskFolder)
+
+    $path = Join-Path $DiskFolder "docker_data.vhdx"
+    if (Test-Path $path) {
+        return $path
+    }
+    return $null
+}
+
+function Test-OptimizeVhdAvailable {
+    try {
+        Import-Module -Name Hyper-V -ErrorAction Stop
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-TrimHelperDistroName {
+    param(
+        [string[]]$Distros,
+        [string[]]$ExcludeDistros,
+        [string]$PreferredDistro
+    )
+
+    if ($PreferredDistro -and ($Distros -contains $PreferredDistro)) {
+        return $PreferredDistro
+    }
+
+    $preferredOrder = @("Ubuntu", "Debian", "Fedora", "openSUSE-Leap")
+    foreach ($name in $preferredOrder) {
+        if ($Distros -contains $name) {
+            return $name
+        }
+    }
+
+    foreach ($distro in $Distros) {
+        if ($ExcludeDistros -notcontains $distro) {
+            return $distro
+        }
+    }
+
+    return $null
+}
+
+function Invoke-DockerPruneFromHost {
+    if (-not (Get-Command docker.exe -ErrorAction SilentlyContinue)) {
+        Write-Status "Docker CLI not found on host; skipping prune" -Type "Warning"
+        return $false
+    }
+
+    try {
+        Write-Status "Pruning unused Docker data via host CLI (docker system prune / builder prune)..." -Type "Warning"
+        docker.exe system prune -a --volumes -f 2>&1 | Out-Null
+        docker.exe builder prune --all -f 2>&1 | Out-Null
+        Write-Status "Docker prune completed via host CLI" -Type "Success"
+        return $true
+    }
+    catch {
+        Write-Status "Docker prune via host CLI failed: $_" -Type "Warning"
+        return $false
+    }
+}
+
+function Convert-ToWslPath {
+    param([string]$WindowsPath)
+
+    $fullPath = (Resolve-Path -LiteralPath $WindowsPath).Path
+    if ($fullPath -match '^([A-Za-z]):\\(.*)$') {
+        $drive = $Matches[1].ToLower()
+        $rest = $Matches[2] -replace '\\', '/'
+        return "/mnt/$drive/$rest"
+    }
+
+    return $fullPath
+}
+
+function Invoke-VhdxFstrimViaMount {
+    param(
+        [string]$VhdxPath,
+        [string]$HelperDistro
+    )
+
+    $mountPoint = "/mnt/dockerdata"
+    $mounted = $false
+    $trimScriptPath = $null
+
+    try {
+        Write-Status "Mounting standalone data VHDX for fstrim: $VhdxPath" -Type "Info"
+        wsl.exe --mount $VhdxPath --vhd 2>&1 | Out-Null
+        $mounted = $true
+
+        $trimScriptPath = Join-Path $env:TEMP ("docker-fstrim-{0}.sh" -f ([guid]::NewGuid().ToString("N")))
+        $trimScriptContent = @"
+#!/bin/sh
+set -eu
+mkdir -p $mountPoint
+device=`$(lsblk -rnpo NAME,SIZE,FSTYPE,MOUNTPOINT | awk '`$3 == "ext4" && `$4 == "" { print `$2, `$1 }' | sort -hr | head -1 | awk '{ print `$2 }')
+if [ -z "`$device" ]; then
+  echo "No unmounted ext4 device found for fstrim" >&2
+  exit 1
+fi
+mount "`$device" $mountPoint
+fstrim -v $mountPoint
+umount $mountPoint
+"@
+
+        Set-Content -LiteralPath $trimScriptPath -Value $trimScriptContent -Encoding ASCII
+        $wslScriptPath = Convert-ToWslPath -WindowsPath $trimScriptPath
+
+        $trimOutput = wsl.exe -d $HelperDistro -u root -- sh $wslScriptPath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw ($trimOutput -join [Environment]::NewLine)
+        }
+
+        Write-Status "Filesystem TRIM on standalone docker_data.vhdx completed" -Type "Success"
+        if ($trimOutput) {
+            $trimOutput | ForEach-Object { Write-Status $_ -Type "Info" }
+        }
+    }
+    catch {
+        Write-Status "Filesystem TRIM on standalone docker_data.vhdx failed: $_" -Type "Warning"
+    }
+    finally {
+        if (Test-Path $trimScriptPath) {
+            Remove-Item -LiteralPath $trimScriptPath -Force -ErrorAction SilentlyContinue
+        }
+        if ($mounted) {
+            try {
+                wsl.exe --unmount $VhdxPath 2>&1 | Out-Null
+            }
+            catch {
+                Write-Status "Failed to unmount standalone data VHDX: $_" -Type "Warning"
+            }
+        }
+    }
+}
+
+function Invoke-VhdxDiskPartCompact {
+    param([string]$VhdxPath)
+
+    $diskpartScript = Join-Path $env:TEMP ("docker-vhdx-compact-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+    $commands = @(
+        "select vdisk file=`"$VhdxPath`""
+        "attach vdisk readonly"
+        "compact vdisk"
+        "detach vdisk"
+        "exit"
+    )
+
+    try {
+        Set-Content -LiteralPath $diskpartScript -Value $commands -Encoding ASCII
+        Write-Status "Compacting VHDX via diskpart (Windows Home fallback): $VhdxPath" -Type "Info"
+        & diskpart.exe /s $diskpartScript 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "diskpart exited with code $LASTEXITCODE"
+        }
+        Write-Status "diskpart compact completed for: $VhdxPath" -Type "Success"
+    }
+    catch {
+        Write-Status "diskpart compact failed for '$VhdxPath': $_" -Type "Warning"
+    }
+    finally {
+        if (Test-Path $diskpartScript) {
+            Remove-Item -LiteralPath $diskpartScript -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Invoke-VhdxCompact {
+    param(
+        [string]$VhdxPath,
+        [bool]$UseOptimizeVhd
+    )
+
+    if (-not (Test-Path $VhdxPath)) {
+        return
+    }
+
+    $sizeBefore = Get-VhdxSize $VhdxPath
+    Write-Status "Compacting VHDX: $VhdxPath (current reported size: $sizeBefore GB)" -Type "Info"
+
+    if ($UseOptimizeVhd) {
+        try {
+            Optimize-VHD -Path $VhdxPath -Mode Full
+            Write-Status "Optimize-VHD completed for: $VhdxPath" -Type "Success"
+        }
+        catch {
+            Write-Status "Optimize-VHD failed for '$VhdxPath': $_" -Type "Warning"
+            Invoke-VhdxDiskPartCompact -VhdxPath $VhdxPath
+        }
+    }
+    else {
+        Invoke-VhdxDiskPartCompact -VhdxPath $VhdxPath
+    }
+}
+
 function Wait-ForDistro {
     param(
         [string]$DistroName,
@@ -260,6 +483,8 @@ Write-Status "Current WSL distros: $($initialDistros -join ', ')"
 
 # Track whether the data distro exists (where Docker images/volumes usually live)
 $dataDistroExists = $initialDistros -contains $DockerDataDistroName
+$standaloneDataVhdxPath = Get-StandaloneDockerDataVhdxPath -DiskFolder $WslDiskFolder
+$usesStandaloneDataVhdx = (-not $dataDistroExists) -and $null -ne $standaloneDataVhdxPath
 
 # Decide which distro to shrink (prefer data distro)
 $target = Get-DockerTargetDistro -Distros $initialDistros -EngineDistro $DockerDistroName -DataDistro $DockerDataDistroName
@@ -269,6 +494,10 @@ if ($distroExists) {
     if ($target.Kind -eq "Engine") {
         Write-Status "Note: '$DockerDataDistroName' not found; shrinking engine distro only" -Type "Warning"
     }
+}
+elseif ($usesStandaloneDataVhdx) {
+    Write-Status "Detected standalone docker_data.vhdx layout (common on newer Docker Desktop / Windows Home)" -Type "Success"
+    Write-Status "Will trim and compact: $standaloneDataVhdxPath" -Type "Info"
 }
 else {
     Write-Status "No Docker WSL distros found ('$DockerDistroName' / '$DockerDataDistroName')" -Type "Warning"
@@ -303,6 +532,19 @@ if (Test-Path $WslDataFolder) {
     }
 }
 
+if (Test-Path $WslMainFolder) {
+    $mainVhdx = Join-Path $WslMainFolder "ext4.vhdx"
+    if (Test-Path $mainVhdx) {
+        $size = Get-VhdxSize $mainVhdx
+        $vhdxFiles += [pscustomobject]@{
+            Path = $mainVhdx
+            Size = $size
+            Name = "ext4.vhdx (main)"
+        }
+        Write-Status "Found: ext4.vhdx (main) ($size GB)"
+    }
+}
+
 if ($vhdxFiles.Count -eq 0) {
     Write-Status "No VHDX files found in $WslDiskFolder or $WslDataFolder" -Type "Warning"
 }
@@ -318,7 +560,24 @@ Write-Status "Total VHDX size before shrink: $totalSizeBefore GB" -Type "Info"
 $performFullReset = $FullReset.IsPresent
 if (-not $performFullReset) {
     Write-Status "Running in NON-DESTRUCTIVE mode: not exporting, unregistering, or deleting VHDX files." -Type "Warning"
-    Write-Status "Only sparse mode (if supported) and Windows TRIM will run. Use -FullReset for a complete reset (this may wipe Docker data on some setups)." -Type "Warning"
+    if ($usesStandaloneDataVhdx) {
+        Write-Status "Standalone docker_data.vhdx mode: fstrim via wsl --mount + diskpart/Optimize-VHD compaction." -Type "Info"
+    }
+    elseif ($dataDistroExists) {
+        Write-Status "Classic layout: in-distro fstrim + Optimize-VHD/diskpart compaction." -Type "Info"
+    }
+    else {
+        Write-Status "Use -FullReset only if you explicitly want a complete reset (this may wipe Docker data on some setups)." -Type "Warning"
+    }
+}
+
+# ============================================================================
+# STEP 1A: HOST DOCKER PRUNE (STANDALONE docker_data.vhdx LAYOUT)
+# ============================================================================
+
+if (-not $performFullReset -and $usesStandaloneDataVhdx -and $PruneDocker) {
+    Write-Step "STEP 1A: Pruning Docker via Host CLI (standalone docker_data.vhdx layout)"
+    Invoke-DockerPruneFromHost | Out-Null
 }
 
 # ============================================================================
@@ -362,6 +621,26 @@ if (-not $performFullReset -and $dataDistroExists) {
     }
     catch {
         Write-Status "Filesystem TRIM inside '$DockerDataDistroName' failed (you may need sudo or fstrim support): $_" -Type "Warning"
+    }
+}
+elseif (-not $performFullReset -and $usesStandaloneDataVhdx) {
+    Write-Step "STEP 1B: Trimming Standalone docker_data.vhdx (Safe Mode)"
+
+    if ($PruneDocker) {
+        Write-Status "Docker prune already handled via host CLI in STEP 1A (if Docker CLI was available)" -Type "Info"
+    }
+    else {
+        Write-Status "Skipping Docker prune (use -PruneDocker to enable host CLI prune)" -Type "Info"
+    }
+
+    $helperDistro = Get-TrimHelperDistroName -Distros $initialDistros -ExcludeDistros @($DockerDistroName, $DockerDataDistroName) -PreferredDistro $TrimHelperDistro
+    if (-not $helperDistro) {
+        Write-Status "No helper WSL distro found for fstrim. Install Ubuntu (or pass -TrimHelperDistro)." -Type "Warning"
+        Write-Status "Compaction may be ineffective without fstrim on standalone docker_data.vhdx." -Type "Warning"
+    }
+    else {
+        Write-Status "Using '$helperDistro' to run fstrim on mounted docker_data.vhdx" -Type "Info"
+        Invoke-VhdxFstrimViaMount -VhdxPath $standaloneDataVhdxPath -HelperDistro $helperDistro
     }
 }
 
@@ -513,29 +792,20 @@ else {
 # ============================================================================
 
 if (-not $performFullReset) {
-    Write-Step "STEP 4B: Compacting VHDX Files (Optimize-VHD)"
+    Write-Step "STEP 4B: Compacting VHDX Files"
 
-    try {
-        Import-Module -Name Hyper-V -ErrorAction Stop
+    $useOptimizeVhd = Test-OptimizeVhdAvailable
+    if ($useOptimizeVhd) {
+        Write-Status "Using Optimize-VHD for compaction" -Type "Info"
     }
-    catch {
-        Write-Status "Hyper-V PowerShell module not available; skipping Optimize-VHD compaction. This may be expected on Windows Home." -Type "Warning"
-        $optimizeModuleAvailable = $false
+    else {
+        Write-Status "Hyper-V module not available (common on Windows Home); using diskpart compact vdisk" -Type "Warning"
     }
 
-    if ($optimizeModuleAvailable -ne $false) {
-        foreach ($vhdx in $vhdxFiles) {
-            if (-not (Test-Path $vhdx.Path)) { continue }
-
-            Write-Status "Optimizing VHDX: $($vhdx.Path) (current reported size: $($vhdx.Size) GB)" -Type "Info"
-            try {
-                Optimize-VHD -Path $vhdx.Path -Mode Full
-                Write-Status "Optimize-VHD completed for: $($vhdx.Path)" -Type "Success"
-            }
-            catch {
-                Write-Status "Optimize-VHD failed for '$($vhdx.Path)': $_" -Type "Warning"
-            }
-        }
+    foreach ($vhdx in $vhdxFiles) {
+        if (-not (Test-Path $vhdx.Path)) { continue }
+        Invoke-VhdxCompact -VhdxPath $vhdx.Path -UseOptimizeVhd $useOptimizeVhd
+        $vhdx.Size = Get-VhdxSize $vhdx.Path
     }
 }
 
@@ -683,6 +953,18 @@ if (Test-Path $WslDataFolder) {
             Path = $dataVhdx
             Size = $size
             Name = "ext4.vhdx (data)"
+        }
+    }
+}
+
+if (Test-Path $WslMainFolder) {
+    $mainVhdx = Join-Path $WslMainFolder "ext4.vhdx"
+    if (Test-Path $mainVhdx) {
+        $size = Get-VhdxSize $mainVhdx
+        $newVhdxFiles += [pscustomobject]@{
+            Path = $mainVhdx
+            Size = $size
+            Name = "ext4.vhdx (main)"
         }
     }
 }

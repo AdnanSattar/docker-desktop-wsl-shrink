@@ -15,6 +15,7 @@
 **Shrink your Docker Desktop VHDX**
 
 [Getting Started](#-quick-start) •
+[Platform Support](#-platform-support) •
 [Why This Exists](#-why-this-exists) •
 [Documentation](docs/docker-wsl-vhdx-shrink-guide.md) •
 [Best Practices](#-best-practices-for-ai-engineers)
@@ -26,6 +27,7 @@
 ## 📋 Table of Contents
 
 - [Why This Exists](#-why-this-exists)
+- [Platform Support](#-platform-support)
 - [The Problem](#-the-problem)
 - [Architecture Overview](#-architecture-overview)
 - [Features](#-features)
@@ -56,6 +58,49 @@ On Windows, all of this gets captured inside a growing WSL2 VHDX file.
 **And it never shrinks by itself.**
 
 This toolkit solves the problem cleanly with a one-click script.
+
+---
+
+## 🌍 Platform Support
+
+| Platform | Needs this toolkit? | Why |
+|----------|---------------------|-----|
+| **Windows (Docker Desktop + WSL2)** | **Yes** | Docker data lives in auto-expanding VHDX files that do not shrink after `docker prune` |
+| **Linux (native Docker)** | No | Docker uses the host filesystem directly; deleted data is reclaimed by the OS |
+| **macOS (Docker Desktop)** | No | Docker Desktop on macOS uses a Linux VM with its own disk image, but day-to-day `docker system prune` and Docker Desktop's built-in disk management are usually sufficient. This repo targets the Windows/WSL2 VHDX problem specifically |
+
+### Windows use cases
+
+Run the shrink script when:
+
+- `docker_data.vhdx` or `ext4.vhdx` is much larger than `docker system df` reports
+- You are on **Windows 11 Home** and cannot use `Optimize-VHD`
+- Your install uses the **standalone `docker_data.vhdx` layout** (no `docker-desktop-data` WSL distro)
+- AI/ML workflows have left large build caches, image layers, or volumes on disk
+
+### Windows layout gaps (now handled in one command)
+
+Older Docker Desktop installs store images/volumes in a **`docker-desktop-data`** WSL distro (`wsl\data\ext4.vhdx`). Newer installs often use a **standalone disk file** instead:
+
+```
+%LOCALAPPDATA%\Docker\wsl\disk\docker_data.vhdx   ← images, volumes, build cache
+%LOCALAPPDATA%\Docker\wsl\main\ext4.vhdx          ← Docker engine (small)
+```
+
+Two gaps blocked effective compaction on many Windows machines:
+
+| Gap | Symptom | Script handling |
+|-----|---------|-----------------|
+| **No `docker-desktop-data` distro** | `-PruneDocker` and in-distro `fstrim` were skipped | Host `docker` CLI prune + `wsl --mount` + `fstrim` on `docker_data.vhdx` |
+| **Windows Home (no Hyper-V module)** | `Optimize-VHD` unavailable; VHDX size unchanged | Automatic **`diskpart compact vdisk`** fallback |
+
+Both paths are handled by the same command:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneDocker
+```
+
+Optional: `-TrimHelperDistro Ubuntu` if auto-detection cannot find a non-Docker WSL distro for `fstrim`.
 
 ---
 
@@ -112,7 +157,7 @@ WSL2 virtual disks automatically grow as you build images and create volumes, bu
 This toolkit implements two complementary strategies:
 
 - **Non-destructive compaction (default)**  
-  Clean up unused Docker data, run filesystem TRIM inside the WSL distro, then compact the VHDX with `Optimize-VHD` and trigger Windows TRIM. This **preserves your Docker images, containers, and volumes**.
+  Clean up unused Docker data, run filesystem TRIM (`fstrim`), then compact the VHDX with `Optimize-VHD` or **`diskpart compact vdisk`** on Windows Home. Supports both **`docker-desktop-data`** and standalone **`docker_data.vhdx`** layouts. Preserves your Docker images, containers, and volumes.
 
 - **Full reset (opt-in, destructive)**  
   For cases where you explicitly want a brand-new Docker environment, the script can export, unregister, and delete the VHDX, then let Docker Desktop recreate a fresh disk and optionally re-import the data distro.
@@ -124,8 +169,9 @@ This toolkit implements two complementary strategies:
 | Feature | Description |
 |---------|-------------|
 | 🔄 **One-click shrink (safe by default)** | Single PowerShell script that compacts VHDX without wiping Docker state |
-| 🧹 **In-distro cleanup** | Optional `-PruneDocker` flag runs `docker system prune` / `docker builder prune` inside WSL |
-| ✂️ **Non-destructive VHDX compaction** | Uses `fstrim` + `Optimize-VHD` to reclaim real Windows disk space |
+| 🧹 **In-distro cleanup** | Optional `-PruneDocker` flag runs `docker system prune` / `docker builder prune` (in WSL or via host CLI) |
+| ✂️ **Non-destructive VHDX compaction** | Uses `fstrim` + `Optimize-VHD` or **`diskpart compact vdisk`** (Windows Home) |
+| 🏠 **Windows Home + docker_data.vhdx** | Standalone disk layout: mount → fstrim → compact in one run |
 | 💾 **Optional full reset mode** | `-FullReset` opt-in path for export/unregister/delete when you truly want a clean Docker slate |
 | ⚡ **Sparse mode** | Enables WSL2 sparse VHDX for future maintenance (where supported) |
 | 📊 **Progress reporting** | Clear status updates throughout the process |
@@ -156,10 +202,16 @@ powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneD
 
 This will:
 
-- Optionally prune unused Docker data inside WSL (via `-PruneDocker`)
-- Run filesystem TRIM (`fstrim -av`) inside the data distro
-- Shut down WSL and compact the VHDX files with `Optimize-VHD -Mode Full`
+- Optionally prune unused Docker data (`-PruneDocker`) — inside `docker-desktop-data` when present, otherwise via the **host Docker CLI**
+- Run filesystem TRIM (`fstrim`) — inside the data distro **or** on standalone `docker_data.vhdx` via `wsl --mount`
+- Shut down WSL and compact VHDX files with **`Optimize-VHD -Mode Full`** (Pro/Enterprise) or **`diskpart compact vdisk`** (Windows Home)
 - Trigger Windows TRIM on the host volume
+
+Verify afterward:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-wsl-state.ps1
+```
 
 ### Option 2: Full reset (destructive, opt-in)
 
@@ -227,8 +279,8 @@ docker-wsl-vhdx-cleanup/
 
 In safe mode, the script:
 
-- Shuts down all WSL instances
-- Optionally runs Docker cleanup **inside the data distro** (`docker-desktop-data`) when `-PruneDocker` is specified:
+- Optionally prunes unused Docker data when `-PruneDocker` is set
+- Uses the **classic** path when `docker-desktop-data` exists:
 
 ```powershell
 wsl --shutdown
@@ -236,23 +288,41 @@ wsl -d docker-desktop-data -- docker system prune -a --volumes -f
 wsl -d docker-desktop-data -- docker builder prune --all -f
 ```
 
+- Uses the **standalone `docker_data.vhdx`** path when that distro is missing (common on Windows Home / newer Docker Desktop):
+
+```powershell
+docker system prune -a --volumes -f
+docker builder prune --all -f
+wsl --shutdown
+wsl --mount "$env:LOCALAPPDATA\Docker\wsl\disk\docker_data.vhdx" --vhd
+# fstrim inside a helper WSL distro (e.g. Ubuntu), then unmount
+```
+
 ### Step 2: Filesystem TRIM inside WSL
 
-The script then runs `fstrim -av` inside the data distro to mark freed blocks as reclaimable:
+**Classic layout** — `fstrim` inside `docker-desktop-data`:
 
 ```powershell
 wsl -d docker-desktop-data -- sudo fstrim -av
 ```
 
-This is what makes the subsequent VHDX compaction effective.
+**Standalone `docker_data.vhdx` layout** — mount the VHDX, then `fstrim` the ext4 filesystem. This marks freed blocks so Windows compaction can reclaim them.
 
 ### Step 3: Compact the VHDX (non-destructive)
 
-With WSL shut down, the script uses the Hyper-V module to compact the VHDX files **without deleting them**:
+With WSL shut down, the script compacts VHDX files **without deleting them**:
 
 ```powershell
+# Windows Pro/Enterprise (Hyper-V module available)
 Import-Module Hyper-V
-Optimize-VHD -Path "$env:LOCALAPPDATA\Docker\wsl\data\ext4.vhdx" -Mode Full
+Optimize-VHD -Path "$env:LOCALAPPDATA\Docker\wsl\disk\docker_data.vhdx" -Mode Full
+
+# Windows Home fallback (no Hyper-V module)
+diskpart
+select vdisk file="C:\Users\<You>\AppData\Local\Docker\wsl\disk\docker_data.vhdx"
+attach vdisk readonly
+compact vdisk
+detach vdisk
 ```
 
 ### Step 4: Enable Sparse Mode
@@ -383,20 +453,24 @@ wsl --manage docker-desktop --set-sparse true --allow-unsafe
 ### VHDX still large after script
 
 ```powershell
-# 1. Check Docker usage inside WSL
-wsl -d docker-desktop-data -- docker system df
+# 1. Check Docker usage (host CLI works on all layouts)
+docker system df
 
 # 2. Run with aggressive prune (safe mode)
 powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneDocker
 
 # 3. Verify sparse status
 fsutil sparse queryflag "$env:LOCALAPPDATA\Docker\wsl\disk\docker_data.vhdx"
+
+# 4. Validate environment
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-wsl-state.ps1
 ```
 
 If the VHDX is still significantly larger than the reported Docker data size, you may be limited by:
 
-- Other non-Docker data stored inside the distro
-- Lack of `Optimize-VHD` (Hyper-V module not available)
+- Unused Docker build cache or volumes still inside the disk (run with `-PruneDocker`)
+- No helper WSL distro for `fstrim` on standalone `docker_data.vhdx` (install Ubuntu or pass `-TrimHelperDistro`)
+- Other non-Docker data stored inside the VHDX
 
 ### Docker Desktop fails to start after cleanup or full reset
 
