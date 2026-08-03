@@ -49,6 +49,15 @@
 .PARAMETER TrimHelperDistro
     WSL distro used to run fstrim when compacting standalone docker_data.vhdx. Auto-detected when omitted.
 
+.PARAMETER WorkFolder
+    Folder for temp scripts and export files. Auto-selected on a drive with enough free space when omitted.
+
+.PARAMETER MinHostFreeGB
+    Minimum free space (GB) required on the drive hosting Docker VHDX files (default: 5).
+
+.PARAMETER MinWorkFreeGB
+    Minimum free space (GB) required on the work/temp drive for safe shrink (default: 2).
+
 .EXAMPLE
     .\shrink-docker-wsl.ps1 -PruneDocker
     Safe non-destructive shrink. Works on Windows Home and standalone docker_data.vhdx layouts.
@@ -108,7 +117,16 @@ param(
     [switch]$Force,
 
     [Parameter(HelpMessage = "Keep the export tar file after completion")]
-    [switch]$KeepExport
+    [switch]$KeepExport,
+
+    [Parameter(HelpMessage = "Work folder for temp scripts and exports (auto-picked from drives with free space when omitted)")]
+    [string]$WorkFolder = "",
+
+    [Parameter(HelpMessage = "Minimum free GB required on the VHDX host drive")]
+    [double]$MinHostFreeGB = 5,
+
+    [Parameter(HelpMessage = "Minimum free GB required on the work/temp drive (safe mode)")]
+    [double]$MinWorkFreeGB = 2
 )
 
 # ============================================================================
@@ -117,6 +135,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "Continue"
+
+$Script:ScriptWorkFolder = $env:TEMP
+$Script:HostDriveLowThresholdGB = 10
+$Script:ExportFileName = "docker_desktop_export.tar"
 
 # Known VHDX file names used by Docker Desktop
 $KnownVhdxNames = @(
@@ -231,6 +253,175 @@ function Test-OptimizeVhdAvailable {
     }
 }
 
+function Get-FixedDriveSpaceInfo {
+    Get-PSDrive -PSProvider FileSystem -ErrorAction SilentlyContinue |
+    Where-Object { $null -ne $_.Free -and $_.Free -gt 0 } |
+    ForEach-Object {
+        [pscustomobject]@{
+            Name    = $_.Name
+            Root    = $_.Root
+            FreeGB  = [math]::Round($_.Free / 1GB, 2)
+            UsedGB  = [math]::Round($_.Used / 1GB, 2)
+            TotalGB = [math]::Round(($_.Free + $_.Used) / 1GB, 2)
+        }
+    }
+}
+
+function Get-DriveLetterFromPath {
+    param([string]$Path)
+
+    $qualifier = Split-Path -Qualifier $Path
+    if ($qualifier) {
+        return $qualifier.TrimEnd(':').ToUpperInvariant()
+    }
+    return $null
+}
+
+function Get-ScriptTempFolder {
+    $tempFolder = Join-Path $Script:ScriptWorkFolder "temp"
+    if (-not (Test-Path $tempFolder)) {
+        New-Item -ItemType Directory -Force -Path $tempFolder | Out-Null
+    }
+    return $tempFolder
+}
+
+function Initialize-WorkFolderAndDiskSpace {
+    param(
+        [string]$RequestedWorkFolder,
+        [string]$VhdxHostPath,
+        [double]$LargestVhdxGB,
+        [bool]$PerformFullReset,
+        [bool]$SkipExport,
+        [bool]$UserSpecifiedExportPath,
+        [string]$UserExportPath,
+        [double]$MinHostFreeGB,
+        [double]$MinWorkFreeGB
+    )
+
+    Write-Step "STEP 0b: Checking Disk Space"
+
+    $driveInfo = @(Get-FixedDriveSpaceInfo)
+    if ($driveInfo.Count -eq 0) {
+        Write-Status "No fixed drives found for disk space check" -Type "Error"
+        exit 1
+    }
+
+    foreach ($drive in $driveInfo) {
+        Write-Status "$($drive.Name): $($drive.FreeGB) GB free / $($drive.TotalGB) GB total" -Type "Info"
+    }
+
+    $hostDriveLetter = Get-DriveLetterFromPath -Path $VhdxHostPath
+    if (-not $hostDriveLetter) {
+        $hostDriveLetter = "C"
+    }
+
+    $requiredHostFreeGB = [math]::Max($MinHostFreeGB, [math]::Ceiling($LargestVhdxGB * 0.1))
+    $requiredWorkFreeGB = $MinWorkFreeGB
+    if ($PerformFullReset -and -not $SkipExport) {
+        $requiredWorkFreeGB = [math]::Max($MinWorkFreeGB, [math]::Ceiling($LargestVhdxGB + 5))
+    }
+
+    Write-Status "VHDX host drive: $hostDriveLetter`: (need >= $requiredHostFreeGB GB free for compaction)" -Type "Info"
+    Write-Status "Work/temp drive: need >= $requiredWorkFreeGB GB free for scripts and exports" -Type "Info"
+
+    $hostDrive = $driveInfo | Where-Object { $_.Name -eq $hostDriveLetter } | Select-Object -First 1
+    if (-not $hostDrive) {
+        Write-Status "Could not determine free space on drive $hostDriveLetter`:" -Type "Error"
+        exit 1
+    }
+
+    if ($hostDrive.FreeGB -lt $requiredHostFreeGB) {
+        Write-Status "Insufficient space on $hostDriveLetter`: (Docker VHDX host drive)" -Type "Error"
+        Write-Status "Found $($hostDrive.FreeGB) GB free; need at least $requiredHostFreeGB GB on $hostDriveLetter`: for VHDX compaction." -Type "Error"
+        Write-Status "Compaction must run on the same drive as docker_data.vhdx — other drives cannot substitute for this requirement." -Type "Warning"
+        Write-Status "Free space on $hostDriveLetter`: (delete files, empty Recycle Bin, run Disk Cleanup), then re-run this script." -Type "Info"
+        exit 1
+    }
+
+    $workCandidates = @(
+        $driveInfo | Where-Object { $_.FreeGB -ge $requiredWorkFreeGB } | Sort-Object FreeGB -Descending
+    )
+
+    if ($RequestedWorkFolder) {
+        $resolvedWorkFolder = $RequestedWorkFolder
+        $workDriveLetter = Get-DriveLetterFromPath -Path $resolvedWorkFolder
+        $workDrive = $driveInfo | Where-Object { $_.Name -eq $workDriveLetter } | Select-Object -First 1
+        if (-not $workDrive -or $workDrive.FreeGB -lt $requiredWorkFreeGB) {
+            $found = if ($workDrive) { "$($workDrive.FreeGB) GB" } else { "unknown" }
+            Write-Status "Work folder drive does not have enough free space: $resolvedWorkFolder" -Type "Error"
+            Write-Status "Found $found free; need at least $requiredWorkFreeGB GB." -Type "Error"
+            Write-Status "Free space on that drive or choose another -WorkFolder, then re-run." -Type "Info"
+            exit 1
+        }
+        $Script:ScriptWorkFolder = $resolvedWorkFolder
+        Write-Status "Using specified work folder: $Script:ScriptWorkFolder" -Type "Success"
+    }
+    elseif ($workCandidates.Count -eq 0) {
+        Write-Status "No drive has enough free space for temp/export work files" -Type "Error"
+        Write-Status "Required: at least $requiredWorkFreeGB GB free on any drive for shrink scripts and exports." -Type "Error"
+        foreach ($drive in $driveInfo) {
+            Write-Status "  $($drive.Name): $($drive.FreeGB) GB free (insufficient)" -Type "Warning"
+        }
+        Write-Status "Free at least $requiredWorkFreeGB GB on any drive (for example E:\docker-wsl-work), then re-run." -Type "Info"
+        exit 1
+    }
+    else {
+        $cDrive = $driveInfo | Where-Object { $_.Name -eq "C" } | Select-Object -First 1
+        $preferAlternateDrive = $cDrive -and ($cDrive.FreeGB -lt $Script:HostDriveLowThresholdGB)
+
+        if ($preferAlternateDrive) {
+            Write-Status "C: drive free space is low ($($cDrive.FreeGB) GB); checking other drives for work files..." -Type "Warning"
+            $alternateCandidates = @(
+                $workCandidates | Where-Object { $_.Name -ne "C" }
+            )
+            if ($alternateCandidates.Count -gt 0) {
+                $selectedDrive = $alternateCandidates | Select-Object -First 1
+                $Script:ScriptWorkFolder = Join-Path $selectedDrive.Root "docker-wsl-work"
+                Write-Status "Auto-selected work folder on drive $($selectedDrive.Name): $Script:ScriptWorkFolder" -Type "Success"
+            }
+            else {
+                Write-Status "C: is low and no other drive has $requiredWorkFreeGB GB free for work files" -Type "Error"
+                foreach ($drive in $driveInfo) {
+                    Write-Status "  $($drive.Name): $($drive.FreeGB) GB free" -Type "Warning"
+                }
+                Write-Status "Free at least $requiredWorkFreeGB GB on another drive (for example E:), then re-run." -Type "Info"
+                exit 1
+            }
+        }
+        elseif ($cDrive -and $cDrive.FreeGB -ge $requiredWorkFreeGB) {
+            $Script:ScriptWorkFolder = Join-Path $cDrive.Root "docker-wsl-work"
+            Write-Status "Auto-selected work folder on C: $Script:ScriptWorkFolder" -Type "Success"
+        }
+        else {
+            $selectedDrive = $workCandidates | Select-Object -First 1
+            $Script:ScriptWorkFolder = Join-Path $selectedDrive.Root "docker-wsl-work"
+            Write-Status "Auto-selected work folder on drive $($selectedDrive.Name): $Script:ScriptWorkFolder" -Type "Success"
+        }
+    }
+
+    $tempFolder = Get-ScriptTempFolder
+    $env:TEMP = $tempFolder
+    $env:TMP = $tempFolder
+    Write-Status "TEMP/TMP redirected to: $tempFolder" -Type "Info"
+
+    $exportPath = $UserExportPath
+    if (-not $UserSpecifiedExportPath) {
+        $exportPath = Join-Path $Script:ScriptWorkFolder $Script:ExportFileName
+        Write-Status "Export path (if needed): $exportPath" -Type "Info"
+    }
+    elseif ($UserExportPath) {
+        $exportDriveLetter = Get-DriveLetterFromPath -Path $UserExportPath
+        $exportDrive = $driveInfo | Where-Object { $_.Name -eq $exportDriveLetter } | Select-Object -First 1
+        if ($exportDrive -and $exportDrive.FreeGB -lt $requiredWorkFreeGB) {
+            Write-Status "Export path drive $exportDriveLetter`: is low on space for -ExportPath" -Type "Error"
+            Write-Status "Found $($exportDrive.FreeGB) GB free; need $requiredWorkFreeGB GB. Use -WorkFolder or another -ExportPath, then re-run." -Type "Info"
+            exit 1
+        }
+    }
+
+    return $exportPath
+}
+
 function Get-TrimHelperDistroName {
     param(
         [string[]]$Distros,
@@ -305,7 +496,7 @@ function Invoke-VhdxFstrimViaMount {
         wsl.exe --mount $VhdxPath --vhd 2>&1 | Out-Null
         $mounted = $true
 
-        $trimScriptPath = Join-Path $env:TEMP ("docker-fstrim-{0}.sh" -f ([guid]::NewGuid().ToString("N")))
+        $trimScriptPath = Join-Path (Get-ScriptTempFolder) ("docker-fstrim-{0}.sh" -f ([guid]::NewGuid().ToString("N")))
         $trimScriptContent = @"
 #!/bin/sh
 set -eu
@@ -354,7 +545,7 @@ umount $mountPoint
 function Invoke-VhdxDiskPartCompact {
     param([string]$VhdxPath)
 
-    $diskpartScript = Join-Path $env:TEMP ("docker-vhdx-compact-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+    $diskpartScript = Join-Path (Get-ScriptTempFolder) ("docker-vhdx-compact-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
     $commands = @(
         "select vdisk file=`"$VhdxPath`""
         "attach vdisk readonly"
@@ -448,7 +639,7 @@ Write-Host @"
  / /_/ / /_/ / /__/ ,< /  __/ /       | |/ |/ /___/ / /___    ___/ / / / / /  / / / / / ,<   
 /_____/\____/\___/_/|_|\___/_/        |__/|__//____/_____/   /____/_/ /_/_/  /_/_/ /_/_/|_|  
                                                                                               
-                           WSL2 VHDX Shrink Toolkit v1.0.0
+                           WSL2 VHDX Shrink Toolkit v1.1.0
 "@ -ForegroundColor Cyan
 
 Write-Host ""
@@ -557,7 +748,24 @@ else {
 }
 Write-Status "Total VHDX size before shrink: $totalSizeBefore GB" -Type "Info"
 
+$largestVhdxGB = if ($vhdxFiles.Count -gt 0) {
+    ($vhdxFiles | Measure-Object -Property Size -Maximum).Maximum
+}
+else {
+    0
+}
+
 $performFullReset = $FullReset.IsPresent
+$ExportPath = Initialize-WorkFolderAndDiskSpace `
+    -RequestedWorkFolder $WorkFolder `
+    -VhdxHostPath $WslDiskFolder `
+    -LargestVhdxGB $largestVhdxGB `
+    -PerformFullReset $performFullReset `
+    -SkipExport $SkipExport.IsPresent `
+    -UserSpecifiedExportPath $PSBoundParameters.ContainsKey('ExportPath') `
+    -UserExportPath $ExportPath `
+    -MinHostFreeGB $MinHostFreeGB `
+    -MinWorkFreeGB $MinWorkFreeGB
 if (-not $performFullReset) {
     Write-Status "Running in NON-DESTRUCTIVE mode: not exporting, unregistering, or deleting VHDX files." -Type "Warning"
     if ($usesStandaloneDataVhdx) {

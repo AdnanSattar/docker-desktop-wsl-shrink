@@ -46,7 +46,7 @@
 Modern AI development workflows push Docker to the limit:
 
 | Challenge | Impact |
-|-----------|--------|
+| ----------- | -------- |
 | Heavy multistage builds | Layers accumulate rapidly |
 | Large language model weights | Multi-GB checkpoints stored in containers |
 | BuildKit caching | Cache grows without bounds |
@@ -64,7 +64,7 @@ This toolkit solves the problem cleanly with a one-click script.
 ## 🌍 Platform Support
 
 | Platform | Needs this toolkit? | Why |
-|----------|---------------------|-----|
+| ---------- | --------------------- | ----- |
 | **Windows (Docker Desktop + WSL2)** | **Yes** | Docker data lives in auto-expanding VHDX files that do not shrink after `docker prune` |
 | **Linux (native Docker)** | No | Docker uses the host filesystem directly; deleted data is reclaimed by the OS |
 | **macOS (Docker Desktop)** | No | Docker Desktop on macOS uses a Linux VM with its own disk image, but day-to-day `docker system prune` and Docker Desktop's built-in disk management are usually sufficient. This repo targets the Windows/WSL2 VHDX problem specifically |
@@ -101,6 +101,30 @@ powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneD
 ```
 
 Optional: `-TrimHelperDistro Ubuntu` if auto-detection cannot find a non-Docker WSL distro for `fstrim`.
+Optional: `-WorkFolder E:\docker-wsl-work` to force temp/export location on a specific drive.
+
+### Low disk space on C
+
+The script checks two requirements before shrinking:
+
+| Requirement | Drive | Typical need |
+|-------------|-------|----------------|
+| **VHDX compaction** | Same drive as `docker_data.vhdx` (usually C:) | ≥ 5 GB free (more for large VHDX files) |
+| **Temp / export files** | Any fixed drive | ≥ 2 GB free (safe mode); largest VHDX + 5 GB for `-FullReset` export |
+
+When C: is below **10 GB** free, the script automatically places work files under `{drive}:\docker-wsl-work` on the drive with the most free space (for example `E:\docker-wsl-work`).
+
+If **no drive** has enough space, the script exits and tells you how much to free before re-running:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneDocker
+```
+
+Force a work folder on E: when C: is tight:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneDocker -WorkFolder E:\docker-wsl-work
+```
 
 ---
 
@@ -167,11 +191,12 @@ This toolkit implements two complementary strategies:
 ## ✨ Features
 
 | Feature | Description |
-|---------|-------------|
+| --------- | ------------- |
 | 🔄 **One-click shrink (safe by default)** | Single PowerShell script that compacts VHDX without wiping Docker state |
 | 🧹 **In-distro cleanup** | Optional `-PruneDocker` flag runs `docker system prune` / `docker builder prune` (in WSL or via host CLI) |
 | ✂️ **Non-destructive VHDX compaction** | Uses `fstrim` + `Optimize-VHD` or **`diskpart compact vdisk`** (Windows Home) |
 | 🏠 **Windows Home + docker_data.vhdx** | Standalone disk layout: mount → fstrim → compact in one run |
+| 💽 **Low disk space handling** | Auto-picks work/temp folder on another drive when C: is low; exits with clear guidance if space is insufficient |
 | 💾 **Optional full reset mode** | `-FullReset` opt-in path for export/unregister/delete when you truly want a clean Docker slate |
 | ⚡ **Sparse mode** | Enables WSL2 sparse VHDX for future maintenance (where supported) |
 | 📊 **Progress reporting** | Clear status updates throughout the process |
@@ -202,6 +227,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneD
 
 This will:
 
+- Check free space on all drives; **auto-use E: (or another drive)** for temp/export when C: is low
+- Stop with a clear message if **any required drive** lacks space (free space, then re-run)
 - Optionally prune unused Docker data (`-PruneDocker`) — inside `docker-desktop-data` when present, otherwise via the **host Docker CLI**
 - Run filesystem TRIM (`fstrim`) — inside the data distro **or** on standalone `docker_data.vhdx` via `wsl --mount`
 - Shut down WSL and compact VHDX files with **`Optimize-VHD -Mode Full`** (Pro/Enterprise) or **`diskpart compact vdisk`** (Windows Home)
@@ -448,6 +475,27 @@ wsl --list --all --verbose
 ```powershell
 # Force sparse mode with unsafe flag (required on some Insider builds)
 wsl --manage docker-desktop --set-sparse true --allow-unsafe
+```
+
+### Insufficient disk space / script exits before shrink
+
+The script checks space **before** shutting down WSL or pruning Docker.
+
+```powershell
+# See current free space on all drives
+Get-PSDrive -PSProvider FileSystem | Select-Object Name,
+  @{N='FreeGB';E={[math]::Round($_.Free/1GB,2)}},
+  @{N='TotalGB';E={[math]::Round(($_.Free+$_.Used)/1GB,2)}}
+```
+
+| Error | What to do |
+| ------- | ------------ |
+| **VHDX host drive** (usually C:) low | Free space on that drive — compaction cannot use E: as a substitute |
+| **Work/temp drive** low on C: | Script auto-picks another drive; or pass `-WorkFolder E:\docker-wsl-work` |
+| **All drives** insufficient | Free the GB amount shown in the error, then re-run |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\shrink-docker-wsl.ps1 -PruneDocker -WorkFolder E:\docker-wsl-work
 ```
 
 ### VHDX still large after script

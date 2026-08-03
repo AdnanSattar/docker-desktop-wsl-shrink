@@ -151,7 +151,7 @@ Recent versions of WSL2 support **sparse VHDX files**. When enabled:
 ### Common Causes of Extreme Growth
 
 | Cause | Description | Impact |
-|-------|-------------|--------|
+| ------- | ------------- | -------- |
 | **Large base images** | Using `ubuntu:latest` instead of `alpine` | +500MB per image |
 | **Build cache** | BuildKit caches all intermediate layers | Can exceed 50GB |
 | **Model files** | AI/ML checkpoints stored in containers | 2-20GB per model |
@@ -198,7 +198,7 @@ This creates a fresh VHDX containing only the actual data.
 ### Solution Comparison
 
 | Method | Reliability | Data Preservation | Complexity |
-|--------|-------------|-------------------|------------|
+| -------- | ------------- | ------------------- | ------------ |
 | `docker prune` | Does not shrink VHDX | Yes | Low |
 | Sparse mode | Partial shrink | Yes | Medium |
 | DiskPart compact | Requires Hyper-V | Yes | High |
@@ -213,8 +213,12 @@ This creates a fresh VHDX containing only the actual data.
 ### Prerequisites
 
 - Administrator PowerShell
-- Docker Desktop closed
-- Sufficient temp space for export
+- Docker Desktop closed (or will be stopped by the script)
+- Sufficient temp space for export (full reset only)
+- **Free space checks (automatic):**
+  - VHDX host drive (usually C:): ≥ 5 GB free for compaction
+  - Work/temp drive: ≥ 2 GB free (safe mode); largest VHDX + 5 GB for export/full reset
+  - When C: is below 10 GB free, temp/export files are placed on another drive (for example `E:\docker-wsl-work`)
 
 ### Step 1: Check Current State
 
@@ -301,6 +305,11 @@ Get-ChildItem "$env:LOCALAPPDATA\Docker\wsl\disk" |
 ### Advanced Options
 
 ```powershell
+# Low C: drive — auto-picks another drive for temp/export (or force E:)
+.\scripts\shrink-docker-wsl.ps1 -PruneDocker -WorkFolder E:\docker-wsl-work
+
+# Custom minimum free space thresholds (GB)
+.\scripts\shrink-docker-wsl.ps1 -PruneDocker -MinHostFreeGB 8 -MinWorkFreeGB 4
 # Skip export (fresh start, lose all Docker data)
 .\scripts\shrink-docker-wsl.ps1 -SkipExport -Force
 
@@ -403,7 +412,7 @@ defrag D: /L
 ### Sparse Mode Limitations
 
 | Issue | Description |
-|-------|-------------|
+| ------- | ------------- |
 | **Windows build dependency** | Some Insider builds disable sparse due to corruption risk |
 | **Not retroactive** | Enabling sparse doesn't immediately shrink existing data |
 | **Fragmentation** | Heavy use can lead to filesystem fragmentation |
@@ -653,6 +662,15 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Docker\wsl" -ErrorAction Silently
 ### Q: Can I move the VHDX to another drive?
 
 **A:** Yes, Docker Desktop Settings > Resources > Advanced > Disk Image Location. However, moving a large VHDX often fails. Shrink first, then move.
+
+### Q: C: drive is almost full — can shrink use E: or D:?
+
+**A:** Partially:
+
+- **Temp scripts and export files** — yes. The shrink script auto-selects a drive with enough free space (for example `E:\docker-wsl-work`) when C: is low. Use `-WorkFolder E:\docker-wsl-work` to force it.
+- **VHDX compaction** — must have free space on the **same drive** as `docker_data.vhdx` (usually C:). If that check fails, free space on C: and re-run.
+
+If every drive is below the required threshold, the script exits with how much space to free before retrying.
 
 ### Q: Does this affect my WSL2 Ubuntu distro?
 
